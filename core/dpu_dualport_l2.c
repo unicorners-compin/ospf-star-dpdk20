@@ -120,8 +120,27 @@ enum pkt_type_rule {
     PKT_BROADCAST = 4,
 };
 
+enum tx_mode {
+    TX_MODE_ETH = 0,
+    TX_MODE_EVENT = 1,
+};
+
+struct tx_ctx {
+    enum tx_mode mode;
+    uint16_t egress_port;
+    uint16_t burst_cap;
+    uint8_t event_dev_id;
+    uint8_t event_port_id;
+    uint8_t event_tx_queue_id;
+    struct rte_mbuf *mbufs[DEFAULT_BURST];
+    struct rte_event evs[DEFAULT_BURST];
+    uint16_t n_mbufs;
+};
+
 static bool delay_q_push(struct rte_mbuf *m, uint64_t send_tsc);
 static uint64_t rate_wait_tsc(uint32_t rule_idx, uint32_t pkt_bits, uint64_t now, uint64_t hz);
+static bool tx_ctx_enqueue_mbuf(struct tx_ctx *ctx, struct rte_mbuf *m);
+static void tx_ctx_flush(struct tx_ctx *ctx);
 
 static uint64_t frame_sig(const struct rte_ether_hdr *eh, uint16_t pkt_len) {
     uint64_t h = 1469598103934665603ULL;
@@ -478,14 +497,61 @@ static bool match_rule(const struct rte_ether_addr *src, const struct rte_ether_
     return false;
 }
 
+static void tx_ctx_flush(struct tx_ctx *ctx) {
+    if (ctx->n_mbufs == 0) {
+        return;
+    }
+
+    uint16_t sent = 0;
+    if (ctx->mode == TX_MODE_ETH) {
+        sent = rte_eth_tx_burst(ctx->egress_port, 0, ctx->mbufs, ctx->n_mbufs);
+        if (ctx->n_mbufs > 0 && sent == 0) {
+            g_tx_burst_zero++;
+        }
+    } else {
+        for (uint16_t i = 0; i < ctx->n_mbufs; i++) {
+            memset(&ctx->evs[i], 0, sizeof(ctx->evs[i]));
+            ctx->mbufs[i]->port = ctx->egress_port;
+            ctx->evs[i].mbuf = ctx->mbufs[i];
+            ctx->evs[i].queue_id = ctx->event_tx_queue_id;
+            ctx->evs[i].op = RTE_EVENT_OP_FORWARD;
+            ctx->evs[i].sched_type = RTE_SCHED_TYPE_ATOMIC;
+        }
+        sent = rte_event_enqueue_burst(ctx->event_dev_id, ctx->event_port_id, ctx->evs, ctx->n_mbufs);
+        if (ctx->n_mbufs > 0 && sent == 0) {
+            g_tx_burst_zero++;
+        }
+    }
+
+    g_fwd += sent;
+    for (uint16_t i = sent; i < ctx->n_mbufs; i++) {
+        g_drop++;
+        rte_pktmbuf_free(ctx->mbufs[i]);
+    }
+    ctx->n_mbufs = 0;
+}
+
+static bool tx_ctx_enqueue_mbuf(struct tx_ctx *ctx, struct rte_mbuf *m) {
+    if (ctx->n_mbufs >= ctx->burst_cap) {
+        tx_ctx_flush(ctx);
+    }
+    if (ctx->n_mbufs >= ctx->burst_cap) {
+        g_drop++;
+        rte_pktmbuf_free(m);
+        return false;
+    }
+    ctx->mbufs[ctx->n_mbufs++] = m;
+    if (ctx->n_mbufs >= ctx->burst_cap) {
+        tx_ctx_flush(ctx);
+    }
+    return true;
+}
+
 static bool apply_impairment_or_queue(struct rte_mbuf *m,
                                       uint32_t rule_idx,
                                       uint64_t now,
                                       uint64_t hz,
-                                      struct rte_mbuf **tx,
-                                      uint16_t *n_tx,
-                                      uint16_t burst_cap,
-                                      uint16_t egress_port,
+                                      struct tx_ctx *txc,
                                       bool trace_ospf_mc) {
     if (trace_ospf_mc) {
         g_ospf_mc_apply_enter++;
@@ -522,31 +588,14 @@ static bool apply_impairment_or_queue(struct rte_mbuf *m,
         return false;
     }
 
-    tx[*n_tx] = m;
-    (*n_tx)++;
-    if (*n_tx >= burst_cap) {
-        uint16_t sent = rte_eth_tx_burst(egress_port, 0, tx, *n_tx);
-        if (*n_tx > 0 && sent == 0) {
-            g_tx_burst_zero++;
-        }
-        g_fwd += sent;
-        for (uint16_t j = sent; j < *n_tx; j++) {
-            g_drop++;
-            rte_pktmbuf_free(tx[j]);
-        }
-        *n_tx = 0;
-    }
-    return true;
+    return tx_ctx_enqueue_mbuf(txc, m);
 }
 
 static void replicate_or_enqueue(struct rte_mbuf *m,
                                  uint32_t rule_idx,
                                  uint64_t now,
                                  uint64_t hz,
-                                 struct rte_mbuf **tx,
-                                 uint16_t *n_tx,
-                                 uint16_t burst_cap,
-                                 uint16_t egress_port,
+                                 struct tx_ctx *txc,
                                  bool trace_ospf_mc) {
     uint16_t rep_cnt = g_rules[rule_idx].replica_count;
     if (rep_cnt == 0) {
@@ -583,7 +632,7 @@ static void replicate_or_enqueue(struct rte_mbuf *m,
                     struct rte_ether_hdr *out_eh = rte_pktmbuf_mtod(out_m, struct rte_ether_hdr *);
                     rte_ether_addr_copy(&g_l2_endpoints[i], &out_eh->dst_addr);
                     g_bum_fanout_replicas++;
-                    apply_impairment_or_queue(out_m, rule_idx, now, hz, tx, n_tx, burst_cap, egress_port, trace_ospf_mc);
+                    apply_impairment_or_queue(out_m, rule_idx, now, hz, txc, trace_ospf_mc);
                     emitted++;
                 }
                 return;
@@ -591,7 +640,7 @@ static void replicate_or_enqueue(struct rte_mbuf *m,
         }
         /* Compatibility fallback when no endpoints/fanout targets are available. */
         g_replica_empty_drop++;
-        apply_impairment_or_queue(m, rule_idx, now, hz, tx, n_tx, burst_cap, egress_port, trace_ospf_mc);
+        apply_impairment_or_queue(m, rule_idx, now, hz, txc, trace_ospf_mc);
         return;
     }
 
@@ -608,7 +657,7 @@ static void replicate_or_enqueue(struct rte_mbuf *m,
         }
         struct rte_ether_hdr *out_eh = rte_pktmbuf_mtod(out_m, struct rte_ether_hdr *);
         rte_ether_addr_copy(&g_rules[rule_idx].replicas[i], &out_eh->dst_addr);
-        apply_impairment_or_queue(out_m, rule_idx, now, hz, tx, n_tx, burst_cap, egress_port, trace_ospf_mc);
+        apply_impairment_or_queue(out_m, rule_idx, now, hz, txc, trace_ospf_mc);
     }
 }
 
@@ -630,25 +679,16 @@ static bool delay_q_push(struct rte_mbuf *m, uint64_t send_tsc) {
     return true;
 }
 
-static void flush_delay_queue(uint16_t egress_port, uint16_t burst, uint64_t now) {
-        struct rte_mbuf *tx[DEFAULT_BURST];
-    uint16_t n_tx = 0;
-    while (!delay_q_empty() && n_tx < burst) {
+static void flush_delay_queue(struct tx_ctx *txc, uint16_t burst, uint64_t now) {
+    uint16_t moved = 0;
+    while (!delay_q_empty() && moved < burst) {
         struct delayed_pkt *dp = &g_delay_q[g_delay_head];
         if (dp->send_tsc > now) {
             break;
         }
-        tx[n_tx++] = dp->m;
+        tx_ctx_enqueue_mbuf(txc, dp->m);
         g_delay_head = (g_delay_head + 1U) % MAX_DELAY_Q;
-    }
-    if (n_tx == 0) {
-        return;
-    }
-    uint16_t sent = rte_eth_tx_burst(egress_port, 0, tx, n_tx);
-    g_fwd += sent;
-    for (uint16_t i = sent; i < n_tx; i++) {
-        g_drop++;
-        rte_pktmbuf_free(tx[i]);
+        moved++;
     }
 }
 
@@ -894,7 +934,6 @@ int main(int argc, char **argv) {
            g_bum_fanout_enable ? "on" : "off");
 
     struct rte_mbuf *rx[DEFAULT_BURST];
-    struct rte_mbuf *tx[DEFAULT_BURST];
     struct rte_event ev[DEFAULT_BURST];
     uint64_t hz = rte_get_timer_hz();
     uint64_t dedup_window = (hz / 1000) * cfg.dedup_ms;
@@ -902,9 +941,12 @@ int main(int argc, char **argv) {
     srand((unsigned)last);
     if (cfg.event_mode) {
         uint8_t evdev_id = 0;
-        uint8_t evport_id = 0;
-        uint8_t evqueue_id = 0;
-        uint8_t adapter_id = 0;
+        uint8_t evport_worker_id = 0;
+        uint8_t evqueue_rx_id = 0;
+        uint8_t evqueue_tx_id = 1;
+        uint8_t rx_adapter_id = 0;
+        uint8_t tx_adapter_id = 0;
+        uint8_t tx_adapter_event_port_id = 0;
         int ev_count = rte_event_dev_count();
         if (ev_count == 0) {
             fprintf(stderr, "[event] no eventdev available\n");
@@ -925,14 +967,24 @@ int main(int argc, char **argv) {
                 }
                 cfg.event_mode = false;
                 printf("[event] fallback to poll mode\n");
+            } else if (info.max_event_queues < 2 || info.max_event_ports < 2) {
+                fprintf(stderr,
+                        "[event] insufficient resources: max_q=%u max_p=%u\n",
+                        info.max_event_queues,
+                        info.max_event_ports);
+                if (cfg.event_strict) {
+                    return 1;
+                }
+                cfg.event_mode = false;
+                printf("[event] fallback to poll mode\n");
             }
         }
 
         if (cfg.event_mode) {
             struct rte_event_dev_config dev_conf;
             memset(&dev_conf, 0, sizeof(dev_conf));
-            dev_conf.nb_event_queues = 1;
-            dev_conf.nb_event_ports = 1;
+            dev_conf.nb_event_queues = 2;
+            dev_conf.nb_event_ports = 2;
             dev_conf.nb_event_queue_flows = 1024;
             dev_conf.nb_event_port_dequeue_depth = cfg.burst_size;
             dev_conf.nb_event_port_enqueue_depth = cfg.burst_size;
@@ -954,8 +1006,19 @@ int main(int argc, char **argv) {
             qconf.nb_atomic_order_sequences = 1024;
             qconf.priority = RTE_EVENT_DEV_PRIORITY_NORMAL;
             qconf.schedule_type = RTE_SCHED_TYPE_ATOMIC;
-            if (rte_event_queue_setup(evdev_id, evqueue_id, &qconf) < 0) {
-                fprintf(stderr, "[event] queue setup failed\n");
+            if (rte_event_queue_setup(evdev_id, evqueue_rx_id, &qconf) < 0) {
+                fprintf(stderr, "[event] queue(rx) setup failed\n");
+                if (cfg.event_strict) {
+                    return 1;
+                }
+                cfg.event_mode = false;
+                printf("[event] fallback to poll mode\n");
+            }
+            qconf.event_queue_cfg |= RTE_EVENT_QUEUE_CFG_SINGLE_LINK;
+            qconf.priority = RTE_EVENT_DEV_PRIORITY_HIGHEST;
+            if (cfg.event_mode &&
+                rte_event_queue_setup(evdev_id, evqueue_tx_id, &qconf) < 0) {
+                fprintf(stderr, "[event] queue(tx) setup failed\n");
                 if (cfg.event_strict) {
                     return 1;
                 }
@@ -970,8 +1033,8 @@ int main(int argc, char **argv) {
             pconf.dequeue_depth = cfg.burst_size;
             pconf.enqueue_depth = cfg.burst_size;
             pconf.new_event_threshold = 4096;
-            if (rte_event_port_setup(evdev_id, evport_id, &pconf) < 0) {
-                fprintf(stderr, "[event] port setup failed\n");
+            if (rte_event_port_setup(evdev_id, evport_worker_id, &pconf) < 0) {
+                fprintf(stderr, "[event] worker port setup failed\n");
                 if (cfg.event_strict) {
                     return 1;
                 }
@@ -981,8 +1044,8 @@ int main(int argc, char **argv) {
         }
 
         if (cfg.event_mode) {
-            if (rte_event_port_link(evdev_id, evport_id, &evqueue_id, NULL, 1) != 1) {
-                fprintf(stderr, "[event] port link failed\n");
+            if (rte_event_port_link(evdev_id, evport_worker_id, &evqueue_rx_id, NULL, 1) != 1) {
+                fprintf(stderr, "[event] worker port link failed\n");
                 if (cfg.event_strict) {
                     return 1;
                 }
@@ -992,7 +1055,7 @@ int main(int argc, char **argv) {
         }
 
         if (cfg.event_mode) {
-            if (rte_event_eth_rx_adapter_create(adapter_id, evdev_id, &((struct rte_event_port_conf){
+            if (rte_event_eth_rx_adapter_create(rx_adapter_id, evdev_id, &((struct rte_event_port_conf){
                     .new_event_threshold = 4096,
                     .dequeue_depth = cfg.burst_size,
                     .enqueue_depth = cfg.burst_size
@@ -1009,10 +1072,10 @@ int main(int argc, char **argv) {
         if (cfg.event_mode) {
             struct rte_event_eth_rx_adapter_queue_conf aq;
             memset(&aq, 0, sizeof(aq));
-            aq.ev.queue_id = evqueue_id;
+            aq.ev.queue_id = evqueue_rx_id;
             aq.ev.sched_type = RTE_SCHED_TYPE_ATOMIC;
             aq.ev.priority = RTE_EVENT_DEV_PRIORITY_NORMAL;
-            if (rte_event_eth_rx_adapter_queue_add(adapter_id, cfg.ingress_port, 0, &aq) < 0) {
+            if (rte_event_eth_rx_adapter_queue_add(rx_adapter_id, cfg.ingress_port, -1, &aq) < 0) {
                 fprintf(stderr, "[event] rx adapter queue add failed\n");
                 if (cfg.event_strict) {
                     return 1;
@@ -1023,7 +1086,28 @@ int main(int argc, char **argv) {
         }
 
         if (cfg.event_mode) {
-            if (rte_event_dev_start(evdev_id) < 0 || rte_event_eth_rx_adapter_start(adapter_id) < 0) {
+            struct rte_event_port_conf tx_pconf;
+            memset(&tx_pconf, 0, sizeof(tx_pconf));
+            tx_pconf.dequeue_depth = cfg.burst_size;
+            tx_pconf.enqueue_depth = cfg.burst_size;
+            tx_pconf.new_event_threshold = 4096;
+            if (rte_event_eth_tx_adapter_create(tx_adapter_id, evdev_id, &tx_pconf) < 0 ||
+                rte_event_eth_tx_adapter_queue_add(tx_adapter_id, cfg.egress_port, -1) < 0 ||
+                rte_event_eth_tx_adapter_event_port_get(tx_adapter_id, &tx_adapter_event_port_id) < 0 ||
+                rte_event_port_link(evdev_id, tx_adapter_event_port_id, &evqueue_tx_id, NULL, 1) != 1) {
+                fprintf(stderr, "[event] tx adapter setup failed\n");
+                if (cfg.event_strict) {
+                    return 1;
+                }
+                cfg.event_mode = false;
+                printf("[event] fallback to poll mode\n");
+            }
+        }
+
+        if (cfg.event_mode) {
+            if (rte_event_dev_start(evdev_id) < 0 ||
+                rte_event_eth_rx_adapter_start(rx_adapter_id) < 0 ||
+                rte_event_eth_tx_adapter_start(tx_adapter_id) < 0) {
                 fprintf(stderr, "[event] start failed\n");
                 if (cfg.event_strict) {
                     return 1;
@@ -1031,7 +1115,11 @@ int main(int argc, char **argv) {
                 cfg.event_mode = false;
                 printf("[event] fallback to poll mode\n");
             } else {
-                printf("[event] active evdev=%u adapter=%u\n", evdev_id, adapter_id);
+                printf("[event] active evdev=%u rx_adapter=%u tx_adapter=%u txq=%u\n",
+                       evdev_id,
+                       rx_adapter_id,
+                       tx_adapter_id,
+                       evqueue_tx_id);
             }
         }
 
@@ -1042,16 +1130,25 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "[rules] reload failed, keeping previous rules\n");
                 }
             }
-            uint64_t now = rte_get_timer_cycles();
-            flush_delay_queue(cfg.egress_port, cfg.burst_size, now);
+            struct tx_ctx txc;
+            memset(&txc, 0, sizeof(txc));
+            txc.mode = TX_MODE_EVENT;
+            txc.egress_port = cfg.egress_port;
+            txc.burst_cap = cfg.burst_size;
+            txc.event_dev_id = evdev_id;
+            txc.event_port_id = evport_worker_id;
+            txc.event_tx_queue_id = evqueue_tx_id;
 
-            uint16_t nb_rx = rte_event_dequeue_burst(evdev_id, evport_id, ev, cfg.burst_size, 0);
+            uint64_t now = rte_get_timer_cycles();
+            flush_delay_queue(&txc, cfg.burst_size, now);
+
+            uint16_t nb_rx = rte_event_dequeue_burst(evdev_id, evport_worker_id, ev, cfg.burst_size, 0);
             if (nb_rx == 0) {
+                tx_ctx_flush(&txc);
                 continue;
             }
             g_rx += nb_rx;
 
-            uint16_t n_tx = 0;
             now = rte_get_timer_cycles();
             for (uint16_t i = 0; i < nb_rx; i++) {
                 struct rte_mbuf *m = ev[i].mbuf;
@@ -1091,39 +1188,16 @@ int main(int argc, char **argv) {
                 if (has_rule) {
                     if (g_rules[rule_idx].replica_count > 0 ||
                         (g_rules[rule_idx].pkt_type != PKT_UNICAST && !g_rules[rule_idx].match_dst)) {
-                        replicate_or_enqueue(m, rule_idx, now, hz, tx, &n_tx, cfg.burst_size, cfg.egress_port, is_ospf_mc);
+                        replicate_or_enqueue(m, rule_idx, now, hz, &txc, is_ospf_mc);
                     } else {
-                        apply_impairment_or_queue(m, rule_idx, now, hz, tx, &n_tx, cfg.burst_size, cfg.egress_port, is_ospf_mc);
+                        apply_impairment_or_queue(m, rule_idx, now, hz, &txc, is_ospf_mc);
                     }
                 } else {
-                    tx[n_tx] = m;
-                    n_tx++;
-                    if (n_tx >= cfg.burst_size) {
-                        uint16_t sent = rte_eth_tx_burst(cfg.egress_port, 0, tx, n_tx);
-                        if (n_tx > 0 && sent == 0) {
-                            g_tx_burst_zero++;
-                        }
-                        g_fwd += sent;
-                        for (uint16_t j = sent; j < n_tx; j++) {
-                            g_drop++;
-                            rte_pktmbuf_free(tx[j]);
-                        }
-                        n_tx = 0;
-                    }
+                    tx_ctx_enqueue_mbuf(&txc, m);
                 }
             }
 
-            if (n_tx > 0) {
-                uint16_t sent = rte_eth_tx_burst(cfg.egress_port, 0, tx, n_tx);
-                if (n_tx > 0 && sent == 0) {
-                    g_tx_burst_zero++;
-                }
-                g_fwd += sent;
-                for (uint16_t i = sent; i < n_tx; i++) {
-                    g_drop++;
-                    rte_pktmbuf_free(tx[i]);
-                }
-            }
+            tx_ctx_flush(&txc);
 
             now = rte_get_timer_cycles();
             if (unlikely(now - last > hz)) {
@@ -1149,9 +1223,12 @@ int main(int argc, char **argv) {
             }
         }
         if (cfg.event_mode) {
-            rte_event_eth_rx_adapter_stop(adapter_id);
-            rte_event_eth_rx_adapter_queue_del(adapter_id, cfg.ingress_port, 0);
-            rte_event_eth_rx_adapter_free(adapter_id);
+            rte_event_eth_tx_adapter_stop(tx_adapter_id);
+            rte_event_eth_tx_adapter_queue_del(tx_adapter_id, cfg.egress_port, -1);
+            rte_event_eth_tx_adapter_free(tx_adapter_id);
+            rte_event_eth_rx_adapter_stop(rx_adapter_id);
+            rte_event_eth_rx_adapter_queue_del(rx_adapter_id, cfg.ingress_port, -1);
+            rte_event_eth_rx_adapter_free(rx_adapter_id);
             rte_event_dev_stop(evdev_id);
             rte_event_dev_close(evdev_id);
         }
@@ -1165,16 +1242,22 @@ int main(int argc, char **argv) {
             }
         }
 
+        struct tx_ctx txc;
+        memset(&txc, 0, sizeof(txc));
+        txc.mode = TX_MODE_ETH;
+        txc.egress_port = cfg.egress_port;
+        txc.burst_cap = cfg.burst_size;
+
         uint64_t now = rte_get_timer_cycles();
-        flush_delay_queue(cfg.egress_port, cfg.burst_size, now);
+        flush_delay_queue(&txc, cfg.burst_size, now);
 
         uint16_t nb_rx = rte_eth_rx_burst(cfg.ingress_port, 0, rx, cfg.burst_size);
         if (nb_rx == 0) {
+            tx_ctx_flush(&txc);
             continue;
         }
 
         g_rx += nb_rx;
-        uint16_t n_tx = 0;
         now = rte_get_timer_cycles();
         for (uint16_t i = 0; i < nb_rx; i++) {
             struct rte_mbuf *m = rx[i];
@@ -1215,39 +1298,15 @@ int main(int argc, char **argv) {
             if (has_rule) {
                 if (g_rules[rule_idx].replica_count > 0 ||
                     (g_rules[rule_idx].pkt_type != PKT_UNICAST && !g_rules[rule_idx].match_dst)) {
-                    replicate_or_enqueue(m, rule_idx, now, hz, tx, &n_tx, cfg.burst_size, cfg.egress_port, is_ospf_mc);
+                    replicate_or_enqueue(m, rule_idx, now, hz, &txc, is_ospf_mc);
                 } else {
-                    apply_impairment_or_queue(m, rule_idx, now, hz, tx, &n_tx, cfg.burst_size, cfg.egress_port, is_ospf_mc);
+                    apply_impairment_or_queue(m, rule_idx, now, hz, &txc, is_ospf_mc);
                 }
             } else {
-                tx[n_tx] = m;
-                n_tx++;
-                if (n_tx >= cfg.burst_size) {
-                    uint16_t sent = rte_eth_tx_burst(cfg.egress_port, 0, tx, n_tx);
-                    if (n_tx > 0 && sent == 0) {
-                        g_tx_burst_zero++;
-                    }
-                    g_fwd += sent;
-                    for (uint16_t j = sent; j < n_tx; j++) {
-                        g_drop++;
-                        rte_pktmbuf_free(tx[j]);
-                    }
-                    n_tx = 0;
-                }
+                tx_ctx_enqueue_mbuf(&txc, m);
             }
         }
-
-        if (n_tx > 0) {
-            uint16_t sent = rte_eth_tx_burst(cfg.egress_port, 0, tx, n_tx);
-            if (n_tx > 0 && sent == 0) {
-                g_tx_burst_zero++;
-            }
-            g_fwd += sent;
-            for (uint16_t i = sent; i < n_tx; i++) {
-                g_drop++;
-                rte_pktmbuf_free(tx[i]);
-            }
-        }
+        tx_ctx_flush(&txc);
 
         now = rte_get_timer_cycles();
         if (unlikely(now - last > hz)) {
